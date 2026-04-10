@@ -1,27 +1,33 @@
-tickers:
-  - HO.PA
-  - AIR.PA
-  - RHM.DE
-  - LDO.MI
-  - HAG.DE
-  - IDR.MC
-  - SAAB-B.ST
-  #- KOG.VI
-  - R3NK.DE
-  - MTX.DE
-  - RR.DE
-  #- GKN.L
-  - AVIO.MI
-  - MTX.DE
-  #- SHE.DE
+stocks:
+  defence:
+    - HO.PA
+    - AIR.PA
+    - RHM.DE
+    - LDO.MI
+    - KOG.OL
+    - BA.L
+    - HAG.DE
+    - IDR.MC
+    - SAAB-B.ST
+    - R3NK.DE
+    - MTX.DE
+    - RR.DE
+    - SAF.PA
+    - AVIO.MI
 
 
 bronze:
   eu_uncertainty: 
-    polars: pl.read_excel('https://policyuncertainty.com/media/Europe_Policy_Uncertainty_Data.xlsx', infer_schema_length=10_000).filter(pl.concat_list(pl.exclude('Year', 'Month')).list.drop_nulls().list.len() > 4).select(pl.date('Year', 'Month', 1).alias('date'), cs.numeric()) # TODO drop Month
+    polars: pl.read_excel('https://policyuncertainty.com/media/Europe_Policy_Uncertainty_Data.xlsx', infer_schema_length=10_000).filter(pl.concat_list(pl.exclude('Year', 'Month')).list.drop_nulls().list.len() > 4).select(pl.date('Year', 'Month', 1).alias('date'), cs.numeric().exclude('Month'))
     freq: monthly
   eu_fx: 
     polars: pl.read_csv(dzip('https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist.zip?6b751cd0b6f02158a105213db574b6b0'), infer_schema_length=10_000).select(pl.col.Date.str.to_date().alias('date'), cs.numeric())
+    freq: daily
+  V2TX:
+    polars: pl.read_csv('https://www.stoxx.com/document/Indices/Current/HistoricalData/h_v2tx.txt', separator=';').select(pl.col.Date.str.to_date().alias('date'), pl.col.Indexvalue.alias('V2TX'))
+    freq: daily
+  brent:
+    polars: pl.read_csv('https://datahub.io/core/oil-prices/_r/-/data/brent-daily.csv', try_parse_dates=True)
     freq: daily
   #eu_shorts:
   #  url: https://www.data.gouv.fr/fr/datasets/r/c2539d1c-8531-4937-9cba-3bd8e9786cc5
@@ -31,7 +37,7 @@ bronze:
   #    seperator: ';'
   #    try_parse_dates: True
   stock_history:
-    polars: get_stocks(tickers)
+    polars: get_stocks(stocks['defence'])
 
 silver:
   eu_stocks_macro:

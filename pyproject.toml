@@ -12,7 +12,7 @@ dependencies = [
     "polars>=1.36.1",
     "pyarrow>=23.0.1",
     "yfinance-pl>=0.7.2.2",
-    "git+https://github.com/aabadie/joblib-s3",
+    #"git+https://github.com/aabadie/joblib-s3",
 ]
 [project.optional-dependencies]
 dev = [

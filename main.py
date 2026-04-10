@@ -1,29 +1,30 @@
-import polars as pl
-import polars.selectors as cs
-from operator import __or__
+import datetime as dt
 from itertools import product
 from math import factorial
-from typing import Mapping, Tuple, Union, List
+from typing import Mapping, Tuple
 
+import numpy as np
 import polars as pl
 import polars.selectors as cs
-
-from extract.io import dump, get_sources, get_sources_config
 
 
 def signature(*exprs: pl.Expr, level: int = 2) -> Mapping[Tuple[str], pl.Expr]:
     """
     Computes path signature components up to any arbitrary level.
     Uses only Polars Expressions and aligns with the piecewise linear assumption.
+
     Return the global cumulative signature as a mapping of word tuples to
     Polars expressions
+
     In practice every element of `exprs` should express increments : 
     it's left to the end-user to choose how those increments are computed. This usually involves calling
     `.diff()` or `.pct_change()` or a log/return transform, depending on the use case at hand.
+
     Parameters
     ----------
     *exprs : pl.Expr    - Expressions. In practice this is advised to pass increments instead of raw fetures
     level  : int       — signature truncation level
+
     Returns
     -------
     Mapping[Tuple[str, ...], pl.Expr]
@@ -79,16 +80,20 @@ def rolling(
 ) -> Mapping[Tuple[str, ...], pl.Expr]:
     """
     Build rolling signature expressions
+
     No DataFrame is touched here.  The returned mapping is applied to a
     DataFrame by the caller, e.g.::
+
         sigs = global_signature(pl.col("A").diff(), pl.col("B").diff(), level=2)
         gs_df = df.select([v.alias(",".join(k)) for k, v in sigs.items()])
         result_30 = gs_df.select([v.alias(",".join(k)) for k, v in rolling(sigs, 30).items()])
+
     Parameters
     ----------
     sigs         : Mapping[Tuple[str, ...], pl.Expr]
         Output of ``global_signature()``.
     window_size : int
+
     Returns
     -------
     Mapping[Tuple[str, ...], pl.Expr]
@@ -96,12 +101,15 @@ def rolling(
         value: a Polars expression implementing Chen's lag-subtraction for that word
         and window — ready to be passed to ``.select()`` on the materialised
         global signature DataFrame.
+
     Implementation note — Chen's identity
     --------------------------------------
     The local helper ``chen(word, lag)`` recovers the window-local signature
     of ``word`` from the global cumulative signature columns via:
+
         S^word[s..e] = (CS^word[e] − CS^word[s])
                      − Σ_{splits} CS^prefix[s] · S^suffix[s..e]
+
     where ``CS^word[s] = pl.col(word).shift(lag).fill_null(0)``.
     The recursion bottoms out at level-1 words (no splits), which reduce to
     a plain lag-subtraction.  Every sub-expression is O(1) column arithmetic.
@@ -119,55 +127,119 @@ def rolling(
     return {word: chen(word, window_size - 1) for word in sigs}
 
 
-def named_signature(df: Union[pl.DataFrame, pl.LazyFrame], **kwargs):
-    cols = cs.expand_selector(df, cs.numeric())
-    exprs = signature(*map(pl.col, cols), **kwargs)  # test with level=3
-    return {f'S({",".join(k)})': v for k, v in exprs.items()}
-
-# TODO : try the transform API from functime
-#@memory.cache
-def compute_signatures( 
-        sources: List[str],
-        target: str,
-        level: int = 3, 
-        group_by = None,
-        index_column='date', 
-        periods: Tuple[int] = (7, 30, 90),
-    ):
-    """
-    signatures are supposed to build out non-linear signal so we caching/discarding them based on a linear Pearson correlation should be enough
-    """
-    config = get_sources_config(sources)
-    sources = get_sources(**config)
-    index = (group_by or [], index_column)
-    df = pl.concat([_df.lazy() for _df in sources.values()], how='align')
-    df = df.drop_nulls(subset=list(index)).sort(index)
-
-    cols = cs.expand_selector(df, cs.numeric())
-    sigs = signature(*(pl.col(col).cast(pl.Float64).pct_change() for col in cols), level=level)  # test with level=3
-    feats = dict()
-    for w in periods:
-        feats.update({f'S({",".join(k)})_{w}d': v.over('ticker') for k, v in rolling(sigs, window_size=w).items()})
-
-    feats = {k: v for k, v in feats.items() if target in k}
-    print(f"Filtered signatures to those containing the target '{target}', starting from {len(sigs)}, resulting in {len(feats)} features.")
-    result, profile =  df.select(*index, **feats).profile(engine='streaming')
-    # TODO : remove co-linear relations and keep lower-level nodes in case of conflicts
-    print(profile.select('node', pl.col.end.sub(pl.col.start).alias('tot_time')))
-    return result
-
-
+    
 if __name__ == '__main__':
-    import polars as pl
-    import argparse
+    ### IMPORTS
+    import esig
+    import iisignature
+    import numpy.testing
+    import polars.testing
+    from sktime.transformations.panel.signature_based import SignatureTransformer
+    
+    
+    ### TESTS ON EXPRESSIONS / MAPPINGS ONLY
+    to_diff = lambda s: pl.col(s).diff().fill_null(0.0)
+    sigs = signature(*map(to_diff, 'ABC'), level=2)
+    assert len(signature(*map(to_diff, 'ABC'), level=3)) == 39
+    assert len(sigs) == 12
+    print(sigs)
+    
+    ### TESTS ON A PLAIN DF
+    feats = {",".join(k): v.tail(1) for k, v in sigs.items()}
+    df = pl.DataFrame({
+        "time": pl.date_range(start=dt.date(2025, 1, 1), end=dt.date(2025, 1, 4), eager=True),
+        "A": [0, 1, 1, 0],
+        "B": [0, 0, 1, 1],
+        "C": [1, 2, 3, 2]
+    })
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-s", "--sources", help="see params.yaml", type=str, nargs='+', required=True)
-    parser.add_argument("-t", "--target", help="filter signatures to those containing this target feature", type=str, required=True)
-    parser.add_argument("-o", "--output", help="output file", type=str, required=True)
-    parser.add_argument("-g", "--group-by", help="group key", type=str, default=None)
-    parser.add_argument("-p", "--periods", type=int, default=30, nargs='+')
-    kw = parser.parse_args()
-    output = kw.__dict__.pop('output')
-    sigs = compute_signatures(**kw.__dict__, index_column='date')
-    dump(sigs, output_path=output, key='date' if kw.group_by is None else [kw.group_by, 'date'])
+    # Simply assess we get the same values from these 2 baseline libraries
+    numpy.testing.assert_array_equal(
+        iisignature.sig(df.drop('time').to_numpy(), 2),
+        esig.stream2sig(df.drop('time').to_numpy().astype(float), depth=2)[1:],
+    )
+
+    ### now test a simple signature computation gives us what we want
+    numpy.testing.assert_array_equal(
+        iisignature.sig(df.drop('time').to_numpy(), 2),
+        df.drop('time').select(**feats).row(0)
+    )
+    print(esig.stream2logsig(df.drop('time').to_numpy().astype(float), depth=2))
+    
+    
+    ### TESTS ON A SPARSER DF : usually the result of a left join between datasets of different cadence
+    df = pl.DataFrame({
+        "time": pl.date_range(start=dt.date(2025, 1, 1), end=dt.date(2025, 1, 4), eager=True),
+        "A": [0, 1, 1, 0],
+        "B": [0, None, 1, None], # let us say be is observed twice less frequently than A
+        "C": [1, 2, 3, 2]
+    })
+
+    #numpy.testing.assert_array_equal(. # FIXME esig/iisignature returns nans
+    #    np.nan_to_num(esig.stream2sig(df.drop('time').to_numpy().astype(float), depth=2)[1:]), # This contains nans, let's fill them
+    #    df.drop('time').select(**feats).row(0)
+    #)
+
+    #### TEST ROLLING SIGNATURE
+    rolling_baseline = pl.DataFrame([{
+        'time': datetime, 
+        'sig': np.nan_to_num(esig.stream2sig(_df.drop('time').to_numpy().astype(float), depth=2)[1:])
+        } for datetime, _df in df.rolling(index_column='time', period='2d')
+    ]).select(pl.col.sig.list.to_array(12)).get_column('sig').to_numpy()
+
+    numpy.testing.assert_array_equal(
+        rolling_baseline,
+        df.rolling(index_column='time', period='2d').agg(**feats).select(cs.list().list.get(0)).to_numpy()
+    )
+    print(df.rolling(index_column='time', period='2d').agg(**feats).select('time', cs.list().list.get(0)))
+
+    window_size = (2, 10, 30)
+    for num_col in (5, 15):
+        for size in (10_000, 50_000):
+            df = pl.from_numpy(np.random.rand(size, num_col)).lazy()
+            sigs = signature(*map(to_diff, df.columns), level=2)
+
+            rolling_baselines = [
+                df.rolling(
+                    index_column=pl.int_range(0, pl.len()), period=f'{w}i'
+                ).agg(**{",".join(k) + f"_{w}": v.tail(1) for k, v in sigs.items()})
+                for w in window_size
+            ]
+            rolling_baseline = pl.concat(rolling_baselines, how='align')
+
+            fast_rolling = df.select(**{",".join(k) + f"_{w}": v for w in window_size for k, v in rolling(sigs, window_size=w).items()})
+
+            rolling_baseline, rolling_profile = rolling_baseline.profile(engine='streaming')
+            fast_rolling, fast_profile = fast_rolling.profile(engine='streaming')
+
+            rolling_profile.filter(pl.col.node.str.contains('group_by_rollin|optimization')) # make sure we don't account for concat/join -> fair benchmark
+            tot_time = pl.col.end.sub(pl.col.start).sum()
+            print(f"""
+                    FAST ROLLING SPEEDUP for shape = ({size},{num_col}) and window_size {window_size}: 
+                    {(rolling_profile.select(tot_time) / fast_profile.select(tot_time)).item(0, 0)}
+            """)
+            polars.testing.assert_frame_equal(rolling_baseline.select(cs.list().list.get(0)), fast_rolling)
+
+    
+    ### TEST CONSISTENT WITH SKTIME
+    signature_transform = SignatureTransformer(
+        augmentation_list=("basepoint",),
+        window_name="global",
+        window_depth=None,
+        window_length=None,
+        window_step=None,
+        rescaling=None,
+        sig_tfm="signature",
+        depth=2,
+    )
+
+    df = pl.DataFrame({ # same df as before, but insert zeros at the very first position = "basepoint" transform
+        "A": [0, 0, 1, 1, 0],
+        "B": [0, 0, 0, 1, 1],
+        "C": [0, 1, 2, 3, 2]
+    })
+
+    numpy.testing.assert_array_equal(
+        signature_transform.fit_transform(df.to_numpy()),
+        df.select(**feats).to_numpy()
+    )

@@ -5,7 +5,6 @@ import yfinance_pl as yf
 import urllib.request
 import zipfile
 import io
-import itertools
 import json
 import dvc.api
 
@@ -46,17 +45,27 @@ def dump(df: pl.DataFrame, output_path: str, key=['date'], **kwargs):  # TODO : 
     df.write_parquet(output_path)
 
 @daily_cache
+def get_stock(ticker: AnyStr) -> pl.DataFrame:
+    return yf.Ticker(ticker).history(period='10y', interval='1d')\
+        .select(pl.lit(ticker).alias('ticker'), pl.col.date.dt.date(), 'close.amount')\
+        .sort(by='date')
+
 def get_stocks(tickers: Tuple[AnyStr]) -> pl.DataFrame:
-    return pl.concat([
-        yf.Ticker(ticker).history(period='10y', interval='1d').select(pl.col.date.dt.date(), pl.lit(ticker).alias('ticker'), 'close.amount', 'volume') 
-        for ticker in tickers
-    ]) # TODO mcp server 
+    res = list()
+    for ticker in tickers:
+        try:
+            _df = get_stock(ticker)
+        except RuntimeError:
+            print(f"Could not download {ticker}, retry in a moment")
+            continue
+        res.append(_df)
+    return pl.concat(res, how='align_full')
 
 @dvc_params
 @daily_cache
 def execute_polars(source: str, **params):
     from functools import reduce
-    _locals = {'cs': cs, 'pl': pl, 'yf': yf, 'get_stocks': get_stocks, 'reduce': reduce, **params}
+    _locals = {'cs': cs, 'pl': pl, 'yf': yf, 'get_stocks': get_stocks, 'reduce': reduce, 'dzip': dzip, **params}
     return eval(source, _locals)
 
 @dvc_params
@@ -73,7 +82,6 @@ def get_sources(**config) -> dict[str, pl.DataFrame]:
     return sources
 
 if __name__ == '__main__':
-    import polars as pl
     import dvc.api
     import argparse
     import itertools
