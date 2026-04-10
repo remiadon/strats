@@ -16,7 +16,7 @@ stocks:
     - AVIO.MI
 
 
-bronze:
+sources:
   eu_uncertainty: 
     polars: pl.read_excel('https://policyuncertainty.com/media/Europe_Policy_Uncertainty_Data.xlsx', infer_schema_length=10_000).filter(pl.concat_list(pl.exclude('Year', 'Month')).list.drop_nulls().list.len() > 4).select(pl.date('Year', 'Month', 1).alias('date'), cs.numeric().exclude('Month'))
     freq: monthly
@@ -38,11 +38,6 @@ bronze:
   #    try_parse_dates: True
   stock_history:
     polars: get_stocks(stocks['defence'])
-
-silver:
-  eu_stocks_macro:
-    polars: >- # TODO : try pl.concat or pl.align_frames
-      reduce(lambda a, b: a.join(b, on='date', how='left'), [stock_history, eu_fx, eu_uncertainty])
 
 gold:
   eu_stocks_macro_signatures:

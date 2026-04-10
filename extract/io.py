@@ -71,36 +71,13 @@ def execute_polars(source: str, **params):
 @dvc_params
 def get_sources_config(names: Optional[Tuple[AnyStr]] = None, **params):
     if names is None:
-        return params['bronze']
-    return {k: v for k, v in params['bronze'].items() if k in names}
+        return params['sources']
+    return {k: v for k, v in params['sources'].items() if k in names}
 
 @daily_cache
-def get_sources(**config) -> dict[str, pl.DataFrame]:
-    sources = dict()
+def get_sources(sources: Tuple[str]) -> dict[str, pl.DataFrame]:
+    _sources = dict()
+    config = get_sources_config(names=sources)
     for name, _map in config.items():
-        sources[name] = execute_polars(_map['polars'], dzip=dzip)
-    return sources
-
-if __name__ == '__main__':
-    import dvc.api
-    import argparse
-    import itertools
-    import re
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-d", "--dataset", help="input file", type=str)
-    parser.add_argument("-o", "--output", help="output file", type=str)
-    parser.add_argument("--corr-threshold", type=float, default=0.7)
-    kw = parser.parse_args()
-    params = dvc.api.params_show()
-
-    dataset_tokens = set(re.split(r'\[|\]|,\s', params['silver'][kw.dataset]['polars']))
-    sources = get_sources(**get_sources_config(tuple(dataset_tokens)))
-    df = execute_polars(params['silver'][kw.dataset]['polars'], **sources)
-    if kw.corr_threshold is not None:
-        corrs = df.select(
-            pl.corr(a, b, method='spearman').gt(kw.corr_threshold).alias(f"{a}<->{b}") 
-            for a, b in itertools.combinations(cs.expand_selector(df, cs.numeric()), 2)
-        ).transpose(include_header=True)
-        print(f"HIGHLY CORRELATED\n", list(itertools.compress(*corrs)), "\n\n")
-    dump(df, output_path='data/'+ kw.dataset + '.parquet')
+        _sources[name] = execute_polars(_map['polars'])
+    return pl.concat(_sources.values(), how='align_full')

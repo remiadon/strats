@@ -137,10 +137,8 @@ def compute_signatures(
     """
     signatures are supposed to build out non-linear signal so we caching/discarding them based on a linear Pearson correlation should be enough
     """
-    config = get_sources_config(sources)
-    sources = get_sources(**config)
+    df = get_sources(sources).lazy()
     index = (group_by or [], index_column)
-    df = pl.concat([_df.lazy() for _df in sources.values()], how='align')
     df = df.drop_nulls(subset=list(index)).sort(index)
 
     cols = cs.expand_selector(df, cs.numeric())
