@@ -74,6 +74,144 @@ def signature(*exprs: pl.Expr, level: int = 2) -> Mapping[Tuple[str], pl.Expr]:
 
     return sigs
 
+def log(
+    sigs: Mapping[Tuple[str, ...], pl.Expr],
+) -> Mapping[Tuple[str, ...], pl.Expr]:
+    """
+    Compute the log-signature from a pre-computed signature mapping.
+
+    Applies ``log(1 + S) = S − S²/2 + S³/3 − …`` in the truncated tensor
+    algebra, then projects onto the **Hall basis** (matching ``esig`` /
+    ``iisignature`` / ``sktime``).
+
+    The truncation level is inferred from the longest key in *sigs*.
+
+    Accepts any ``Mapping[Tuple[str, ...], pl.Expr]``, so composes freely::
+
+        log(signature(...))           # global log-signature
+        log(rolling(signature(...)))  # rolling log-signature
+    """
+    level = max(len(k) for k in sigs)
+    channels = [k[0] for k in sigs if len(k) == 1]
+
+    # ── Step 1: tensor-algebra logarithm ─────────────────────────────
+    # log(1+S) = S − S⊗S/2 + S⊗S⊗S/3 − …   (truncated at `level`)
+    tensor_log: dict[Tuple[str, ...], pl.Expr] = dict(sigs)
+    s_power: dict[Tuple[str, ...], pl.Expr] = dict(sigs)
+
+    for k in range(2, level + 1):
+        new_power: dict[Tuple[str, ...], pl.Expr] = {}
+        for w1, e1 in s_power.items():
+            for w2, e2 in sigs.items():
+                w_cat = w1 + w2
+                if len(w_cat) > level:
+                    continue
+                new_power[w_cat] = new_power.get(w_cat, pl.lit(0.0)) + e1 * e2
+        s_power = new_power
+        coeff = ((-1) ** (k + 1)) / k
+        for word, expr in s_power.items():
+            tensor_log[word] = tensor_log.get(word, pl.lit(0.0)) + pl.lit(coeff) * expr
+
+    # ── Step 2: build Hall basis & expand each element to tensor words ──
+    # A Hall element is either a letter (str) or a bracket (h_left, h_right).
+    # We represent each as a tree and also cache its tensor-word expansion
+    # (dict of {word_tuple: int coefficient}) and its "foliage" (the leading
+    # tensor word = concatenation of its leaves left-to-right).
+
+    def _foliage(h) -> Tuple[str, ...]:
+        """Concatenation of the leaves of a Hall tree, left to right."""
+        if isinstance(h, str):
+            return (h,)
+        return _foliage(h[0]) + _foliage(h[1])
+
+    def _expand(h) -> dict[Tuple[str, ...], int]:
+        """Expand a Hall bracket tree into the tensor algebra."""
+        if isinstance(h, str):
+            return {(h,): 1}
+        e1, e2 = _expand(h[0]), _expand(h[1])
+        out: dict[Tuple[str, ...], int] = {}
+        for w1, c1 in e1.items():
+            for w2, c2 in e2.items():
+                fwd, rev = w1 + w2, w2 + w1
+                out[fwd] = out.get(fwd, 0) + c1 * c2
+                out[rev] = out.get(rev, 0) - c1 * c2
+        return {w: c for w, c in out.items() if c != 0}
+
+    def _deg(h) -> int:
+        return 1 if isinstance(h, str) else _deg(h[0]) + _deg(h[1])
+
+    # Build Hall set level by level.
+    # Ordering: all degree-k elements < all degree-(k+1) elements.
+    # Within a degree, letters use channel order; brackets [h1,h2] are
+    # sorted by (h1, h2) where each is compared by its position in the
+    # accumulated `hall` list (i.e. by index).
+    hall: list = list(channels)  # level 1: letters in channel order
+    idx = {ch: i for i, ch in enumerate(channels)}  # element → position
+
+    for deg in range(2, level + 1):
+        new = []
+        for d1 in range(1, deg):
+            d2 = deg - d1
+            left_elems  = [h for h in hall if _deg(h) == d1]
+            right_elems = [h for h in hall if _deg(h) == d2]
+            for h1 in left_elems:
+                for h2 in right_elems:
+                    if idx[h1] >= idx[h2]:      # need h1 < h2
+                        continue
+                    if not isinstance(h2, str): # if h2 is a bracket [h21, h22]
+                        h21 = h2[0]
+                        if idx[h1] < idx[h21]:  # need h1 >= h21
+                            continue
+                    new.append((h1, h2))
+        # Sort new brackets by (h1_index, h2_index) to match esig ordering
+        new.sort(key=lambda b: (idx[b[0]], idx[b[1]]))
+        for h in new:
+            idx[h] = len(hall)
+            hall.append(h)
+
+    # ── Step 3: extract Hall coordinates via linear solve ────────────
+    # At each degree d, build the expansion matrix M where M[i,j] is the
+    # coefficient of tensor-word i in the expansion of Hall element j.
+    # Then coords = M⁺ · tensor_log_vec  (pseudo-inverse, precomputed once).
+    # This handles coupled Hall elements (e.g. [B,[A,C]] and [C,[A,B]]
+    # which share tensor words due to the Jacobi identity).
+    result: dict[Tuple[str, ...], pl.Expr] = {}
+
+    for deg in range(1, level + 1):
+        hall_deg = [h for h in hall if _deg(h) == deg]
+        words_deg = [w for w in product(channels, repeat=deg)]
+
+        if deg == 1:
+            # Level 1: identity mapping
+            for h in hall_deg:
+                result[_foliage(h)] = tensor_log[_foliage(h)]
+            continue
+
+        # Build expansion matrix and solve for the coordinate transform
+        expansions = [_expand(h) for h in hall_deg]
+        word_to_idx = {w: i for i, w in enumerate(words_deg)}
+        M = np.zeros((len(words_deg), len(hall_deg)))
+        for j, exp in enumerate(expansions):
+            for w, c in exp.items():
+                M[word_to_idx[w], j] = c
+
+        # Pseudo-inverse: coords = M⁺ @ tensor_log_vector
+        # M⁺ is (n_hall x n_words), so each Hall coordinate is a fixed
+        # linear combination of tensor_log entries — purely expression algebra.
+        M_pinv = np.linalg.pinv(M)
+
+        for j, h in enumerate(hall_deg):
+            expr = pl.lit(0.0)
+            for i, w in enumerate(words_deg):
+                coeff = M_pinv[j, i]
+                if abs(coeff) < 1e-14:
+                    continue
+                expr = expr + pl.lit(coeff) * tensor_log[w]
+            result[_foliage(h)] = expr
+
+    return result
+
+
 def rolling(
     sigs: Mapping[Tuple[str, ...], pl.Expr],
     window_size: int,
@@ -135,6 +273,9 @@ if __name__ == '__main__':
     import numpy.testing
     import polars.testing
     from sktime.transformations.panel.signature_based import SignatureTransformer
+    import sktime
+    assert sktime.__version__ == "0.40.1"
+    assert iisignature.__version__ == "0.24"
     
     
     ### TESTS ON EXPRESSIONS / MAPPINGS ONLY
@@ -205,9 +346,10 @@ if __name__ == '__main__':
                 ).agg(**{",".join(k) + f"_{w}": v.tail(1) for k, v in sigs.items()})
                 for w in window_size
             ]
+
             rolling_baseline = pl.concat(rolling_baselines, how='align')
 
-            fast_rolling = df.select(**{",".join(k) + f"_{w}": v for w in window_size for k, v in rolling(sigs, window_size=w).items()})
+            fast_rolling = df.select(**{",".join(k) + f"_{w}": v for w in window_size for k, v in rolling(sigs, window_size=w).items()})#
 
             rolling_baseline, rolling_profile = rolling_baseline.profile(engine='streaming')
             fast_rolling, fast_profile = fast_rolling.profile(engine='streaming')
@@ -243,3 +385,128 @@ if __name__ == '__main__':
         signature_transform.fit_transform(df.to_numpy()),
         df.select(**feats).to_numpy()
     )
+
+    ############################################################################
+    # LOG-SIGNATURE TESTS
+    ############################################################################
+
+    ### TEST LOG-SIGNATURE: component count matches esig
+    for lvl in (2, 3):
+        _sigs = signature(*map(to_diff, 'ABC'), level=lvl)
+        _logsigs = log(_sigs)
+        expected = len(esig.stream2logsig(np.zeros((2, 3)), depth=lvl))
+        assert len(_logsigs) == expected, f"depth {lvl}: got {len(_logsigs)}, expected {expected}"
+    print("LOG-SIG component count tests passed")
+
+    ### TEST LOG-SIGNATURE vs esig at depth 2 & 3
+    df = pl.DataFrame({
+        "time": pl.date_range(start=dt.date(2025, 1, 1), end=dt.date(2025, 1, 4), eager=True),
+        "A": [0, 1, 1, 0],
+        "B": [0, 0, 1, 1],
+        "C": [1, 2, 3, 2]
+    })
+    for lvl in (2, 3):
+        _sigs = signature(*map(to_diff, 'ABC'), level=lvl)
+        log_feats = {",".join(k): v.tail(1) for k, v in log(_sigs).items()}
+        numpy.testing.assert_array_almost_equal(
+            esig.stream2logsig(df.drop('time').to_numpy().astype(float), depth=lvl),
+            df.drop('time').select(**log_feats).row(0),
+        )
+    print("LOG-SIG vs esig passed (depth 2 & 3)")
+
+    ### TEST LOG-SIGNATURE vs sktime
+    logsig_transform = SignatureTransformer(
+        augmentation_list=("basepoint",), window_name="global",
+        window_depth=None, window_length=None, window_step=None,
+        rescaling=None, sig_tfm="logsignature", depth=2,
+    )
+    df_bp = pl.DataFrame({
+        "A": [0, 0, 1, 1, 0], "B": [0, 0, 0, 1, 1], "C": [0, 1, 2, 3, 2]
+    })
+    _sigs = signature(*map(to_diff, 'ABC'), level=2)
+    log_feats_bp = {",".join(k): v.tail(1) for k, v in log(_sigs).items()}
+    numpy.testing.assert_array_almost_equal(
+        logsig_transform.fit_transform(df_bp.to_numpy()),
+        df_bp.select(**log_feats_bp).to_numpy(),
+    )
+    print("LOG-SIG vs sktime passed")
+
+    ### TEST LOG-SIGNATURE composability: log(rolling(sig, full_window)) == log(sig)
+    df = pl.DataFrame({
+        "time": pl.date_range(start=dt.date(2025, 1, 1), end=dt.date(2025, 1, 4), eager=True),
+        "A": [0, 1, 1, 0], "B": [0, 0, 1, 1], "C": [1, 2, 3, 2]
+    })
+    _sigs = signature(*map(to_diff, 'ABC'), level=2)
+    global_log_feats = {",".join(k): v.tail(1) for k, v in log(_sigs).items()}
+    rolling_log_feats = {",".join(k): v.tail(1) for k, v in log(rolling(_sigs, window_size=len(df))).items()}
+    numpy.testing.assert_array_almost_equal(
+        df.drop('time').select(**global_log_feats).row(0),
+        df.drop('time').select(**rolling_log_feats).row(0),
+    )
+    print("LOG-SIG composability passed: log(rolling(sig)) works")
+
+    ### TEST ROLLING LOG-SIGNATURE vs sktime SignatureTransformer(window_name="sliding")
+    # Use raw data (no basepoint row); sktime prepends it via augmentation_list=("basepoint",)
+    # Our code uses df_bp (with basepoint prepended manually) to match
+    df_raw = pl.DataFrame({"A": [0, 1, 1, 0], "B": [0, 0, 1, 1], "C": [1, 2, 3, 2]})
+    df_bp = pl.DataFrame({
+        "A": [0, 0, 1, 1, 0], "B": [0, 0, 0, 1, 1], "C": [0, 1, 2, 3, 2]
+    })
+    for lvl in (2, 3):
+        for w in (2, 3):
+            logsig_sliding = SignatureTransformer(
+                augmentation_list=("basepoint",), window_name="sliding",
+                window_length=w, window_step=1,
+                rescaling=None, sig_tfm="logsignature", depth=lvl,
+            )
+            # sktime adds basepoint → sees len(df_raw)+1 rows → (len(df_raw)+1 - w + 1) windows
+            sktime_out = logsig_sliding.fit_transform(df_raw.to_numpy())
+            n_windows = len(df_raw) + 1 - w + 1  # +1 for basepoint row sktime adds
+
+            _sigs = signature(*map(to_diff, 'ABC'), level=lvl)
+            _logsigs = log(rolling(_sigs, window_size=w))
+            n_logsig = len(_logsigs)
+            ours = df_bp.select(**{",".join(k): v for k, v in _logsigs.items()}).to_numpy()
+
+            sktime_matrix = sktime_out.to_numpy().reshape(n_windows, n_logsig)
+            numpy.testing.assert_array_almost_equal(
+                sktime_matrix,
+                ours[w - 1:],
+            )
+    print("ROLLING LOG-SIG vs sktime passed (depth 2 & 3, windows 2 & 3)")
+
+    ### TEST ROLLING LOG-SIGNATURE on larger random data vs sktime
+    np.random.seed(42)
+    for num_col, size in [(3, 20), (5, 20)]:
+        raw = np.random.rand(size, num_col)
+        raw_bp = np.vstack([np.zeros((1, num_col)), raw])  # basepoint
+        df_bp = pl.from_numpy(raw_bp)
+        cols = df_bp.columns
+        for lvl in (2, 3):
+            for w in (2, 5):
+                logsig_sliding = SignatureTransformer(
+                    augmentation_list=("basepoint",), window_name="sliding",
+                    window_length=w, window_step=1,
+                    rescaling=None, sig_tfm="logsignature", depth=lvl,
+                )
+                # sktime adds basepoint → sees size+1 rows → (size+1 - w + 1) windows
+                sktime_out = logsig_sliding.fit_transform(raw)
+                n_windows = size + 1 - w + 1
+
+                _sigs = signature(*map(to_diff, cols), level=lvl)
+                _logsigs = log(rolling(_sigs, window_size=w))
+                n_logsig = len(_logsigs)
+                ours = df_bp.select(**{",".join(k): v for k, v in _logsigs.items()}).to_numpy()
+
+                sktime_matrix = sktime_out.to_numpy().reshape(n_windows, n_logsig)
+                numpy.testing.assert_array_almost_equal(sktime_matrix, ours[w - 1:])
+        print(f"  ROLLING LOG-SIG vs sktime passed for shape=({size},{num_col})")
+
+    ### TEST DIMENSIONALITY REDUCTION
+    for d in (2, 3, 5, 10):
+        for lvl in (2, 3):
+            _sigs = signature(*map(to_diff, [f'c{i}' for i in range(d)]), level=lvl)
+            assert len(log(_sigs)) < len(_sigs)
+    print("LOG-SIG dimensionality reduction verified")
+
+    print("ALL LOG-SIGNATURE TESTS PASSED")

@@ -1,5 +1,0 @@
-[core]
-    remote = bucket
-['remote "bucket"']
-    url = s3://lance/
-    profile = strats
