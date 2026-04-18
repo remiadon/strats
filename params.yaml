@@ -39,6 +39,3 @@ sources:
   stock_history:
     polars: get_stocks(stocks['defence'])
 
-gold:
-  eu_stocks_macro_signatures:
-    polars.

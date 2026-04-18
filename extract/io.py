@@ -6,12 +6,10 @@ import urllib.request
 import zipfile
 import io
 import json
-import dvc.api
 
 from .cache import daily_cache
-from . import execute_and_pass
-
-dvc_params = execute_and_pass(dvc.api.params_show)
+import yaml
+dvc_params = yaml.safe_load(open('../params.yaml')) #FIXME
 
 #rich_df = import_from_gist('b0d32072f234fba73650eb4b1e9c0017', name='rich_df', files_head_member='rich_display_pandas_dataframe.py')
 
@@ -61,18 +59,16 @@ def get_stocks(tickers: Tuple[AnyStr]) -> pl.DataFrame:
         res.append(_df)
     return pl.concat(res, how='align_full')
 
-@dvc_params
 @daily_cache
-def execute_polars(source: str, **params):
+def execute_polars(source: str):
     from functools import reduce
-    _locals = {'cs': cs, 'pl': pl, 'yf': yf, 'get_stocks': get_stocks, 'reduce': reduce, 'dzip': dzip, **params}
+    _locals = {'cs': cs, 'pl': pl, 'yf': yf, 'get_stocks': get_stocks, 'reduce': reduce, 'dzip': dzip, **dvc_params}
     return eval(source, _locals)
 
-@dvc_params
-def get_sources_config(names: Optional[Tuple[AnyStr]] = None, **params):
+def get_sources_config(names: Optional[Tuple[AnyStr]] = None):
     if names is None:
-        return params['sources']
-    return {k: v for k, v in params['sources'].items() if k in names}
+        return dvc_params['sources']
+    return {k: v for k, v in dvc_params['sources'].items() if k in names}
 
 @daily_cache
 def get_sources(sources: Tuple[str]) -> dict[str, pl.DataFrame]:
