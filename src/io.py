@@ -2,16 +2,24 @@ from typing import Tuple, AnyStr, Optional
 import polars as pl
 import polars.selectors as cs
 import yfinance_pl as yf
+import datetime as dt
+from joblib import Memory
 import urllib.request
 import zipfile
 import io
 import json
-
-from .cache import daily_cache
 import yaml
-dvc_params = yaml.safe_load(open('../params.yaml')) #FIXME
 
-#rich_df = import_from_gist('b0d32072f234fba73650eb4b1e9c0017', name='rich_df', files_head_member='rich_display_pandas_dataframe.py')
+dvc_params = yaml.safe_load(open('../params.yaml')) #FIXME
+memory = Memory('joblib_cache', verbose=0, compress=True)
+
+def daily_cache_validation_callback(metadata):
+    last_call_at = dt.datetime.fromtimestamp(metadata['time'])
+    return last_call_at.date() == dt.date.today()
+
+# TODO : we have information about the cadence of each source in the params.yaml file -> create a daily_cache and a monthly_cache
+daily_cache = memory.cache(cache_validation_callback=daily_cache_validation_callback)
+
 
 def dzip(url: str, csv_filename_in_zip: str = None) -> io.StringIO:
     with urllib.request.urlopen(url) as response:
