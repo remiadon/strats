@@ -10,7 +10,7 @@ dependencies = [
     "pandas>=2.3.3",
     "polars>=1.36.1",
     "pyarrow>=23.0.1",
-    "sparklen>=1.0.0",
+    "swig;sparklen>=1.0.0",
     "yfinance-pl>=0.7.2.2",
     #"git+https://github.com/aabadie/joblib-s3",
 ]
@@ -20,7 +20,7 @@ dev = [
   "ipython",
   "ipykernel",
   "esig",
-  "iisignature",
+  #"iisignature",
 ]
 
 [tool.setuptools.packages.find]
